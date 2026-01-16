@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+validate the groundtruth for a cfr file, or a folder of cfr files 
+when the example uses "argc" as its source of non-determinism.
+
+Currently, this script has a lot of limitations:
+1. It only works with ELF binaries and assumes x86_64 architecture
+3. Requires the use of pwndbg (https://github.com/pwndbg/pwndbg)
+4. With the current implementation (6/18/25), assumes all questions are valid and well formatted
+"""
+import os
+import re
+import sys
+import json
+import subprocess
+import argparse
+import tempfile
+import textwrap
+import logging
+import concurrent.futures
+import datetime
+from pathlib import Path
+
+from elftools.elf.elffile import ELFFile
+from elftools.common.exceptions import ELFError
+
+# set up module-level logger for debug info
+logger = logging.getLogger(__name__)
+
+# Enum-like constants for status
+STATUS_PASS = "PASS"
+STATUS_FAIL = "FAIL"
+STATUS_SKIP = "SKIP"
+
+def find_cfr_files(root_dir):
+    for dp, _, files in os.walk(root_dir):
+        for fn in files:
+            if fn.endswith('cfr.json'):
+                yield os.path.join(dp, fn)
+
+def get_elf_virtual_address_for_offset(binary, file_offset):
+    with open(binary, 'rb') as f:
+        elf = ELFFile(f)
+        sec = elf.get_section_by_name('.text')
+        if not sec:
+            raise RuntimeError(f".text missing in ELF: {binary}")
+        section_offset = sec.header.sh_offset
+        section_addr = sec.header.sh_addr
+        section_size = sec.header.sh_size
+
+        # Check if the file offset is within the section
+        if section_offset <= file_offset < section_offset + section_size:
+            # Calculate the virtual address
+            virtual_address = section_addr + (file_offset - section_offset)
+            return virtual_address
+        else:
+            raise ValueError(f"File offset {file_offset} is outside the .text section.")
+
+def get_elf_text_info(binary):
+    with open(binary, 'rb') as f:
+        elf = ELFFile(f)
+        sec = elf.get_section_by_name('.text')
+        if not sec:
+            raise RuntimeError(f".text missing in ELF: {binary}")
+        return sec.header.sh_offset, sec.header.sh_addr
+
+
+def get_runtime_text_base(binary, debug=False):
+    cmd = [
+        "pwndbg", "--batch", "--quiet", "--nx", binary,
+        "-ex", "set disable-randomization on",
+        "-ex", "info files"
+    ]
+    if debug:
+        logger.debug(f"get_runtime_text_base: running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if debug:
+        logger.debug(f"info files stdout:\n{proc.stdout}")
+        logger.debug(f"info files stderr:\n{proc.stderr}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"GDB info files failed: {proc.stderr.strip()}")
+    for line in proc.stdout.splitlines():
+        m = re.match(r"\s*(0x[0-9A-Fa-f]+)\s*-\s*0x[0-9A-Fa-f]+\s*is\s*\.text", line)
+        if m:
+            return int(m.group(1), 16)
+    raise RuntimeError(".text mapping not found in GDB info files")
+
+
+def query_rax_with_gdb(binary: str, entrypoint: int, break_va: int, argc: int, debug=False) -> list[str] | None:
+    """
+    Run the binary under Pwndbg, break at `break_va`, steps one instruction, returns RIP.
+    """
+    args_list = " ".join(str(i) for i in range(1, argc + 1)) or ""
+
+    if entrypoint > 0x555555550000: # this is weird. some binaries need some time to "load"
+        gdb_script = textwrap.dedent(f"""\
+            set disable-randomization on
+            set args {args_list}
+            starti
+            b *{entrypoint:#x}
+            c
+            b *{break_va:#x}
+            while (1)
+            c
+            si
+            print/x $rip
+            end
+        """)
+    else:
+        gdb_script = textwrap.dedent(f"""\
+            set disable-randomization on
+            set args {args_list}
+            starti
+            b *{break_va:#x}
+            while (1)
+            c
+            si
+            print/x $rip
+            end
+        """)
+
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".gdb") as tf:
+        tf.write(gdb_script)
+        script_path = Path(tf.name)
+
+    gdb_cmd = [
+        "pwndbg", "--batch", "--quiet", "--nx",
+        "-x", str(script_path),
+        binary,
+    ]
+
+    if debug:
+        logger.debug("[gdb cmd] %s", " ".join(gdb_cmd))
+        logger.debug("--- .gdb script ---\n%s\n-------------------", gdb_script)
+
+    try:
+        res = subprocess.run(
+            gdb_cmd, capture_output=True, text=True#, check=True
+        )
+    except Exception as e:
+        if debug:
+            logger.debug("pwndbg crashed (most likely because the necessary branches were not taken)")
+            logger.debug("Error:\n%s", e)
+        return None
+    finally:
+        script_path.unlink(missing_ok=True)
+
+    HEX_RE = re.compile(r"\$[0-9]+\s*=\s*0x([0-9a-fA-F]+)")
+    m = HEX_RE.findall(res.stdout)
+    if not m:
+        if debug:
+            logger.debug("no $N = 0x… line, raw gdb output:\n%s", res.stdout)
+        return None
+
+    return m
+
+
+def check_argc_worker(argc_count, binary, rt_base, break_va, base, debug):
+    """
+    Worker function to process a single argc value.
+    Returns (argc_count, list_of_targets).
+    """
+    results = query_rax_with_gdb(binary, rt_base, break_va, argc_count, debug)
+    if results is None:
+        return argc_count, []
+    
+    found_targets = []
+    for match in results:
+        rax = int(match, 16)
+        fo = rax - base
+        if hex(fo) not in found_targets:
+            found_targets.append(hex(fo))
+            
+    return argc_count, found_targets
+
+
+def validate_one(cfr_path, root_dir, log_func, max_args=53, debug=False, max_workers=None):
+    """
+    Validates a single CFR file.
+    Returns (status, arg_map, relative_path)
+    status is one of STATUS_PASS, STATUS_FAIL, STATUS_SKIP
+    """
+    rel = os.path.relpath(cfr_path, root_dir)
+    try:
+        data = json.load(open(cfr_path))
+    except Exception as e:
+        log_func(f"{rel}: Failed to load JSON ({e})")
+        return STATUS_SKIP, None, rel
+
+    prog = data.get("program")
+    question = data.get("question", "")
+    
+    if not prog or not question:
+        log_func(f"{rel}: Invalid JSON structure")
+        return STATUS_SKIP, None, rel
+
+    split_question = question.split("'")
+
+    if (len(split_question) < 5 or
+        split_question[0] != 'What are the file offsets for the instructions that are the targets of the ' or
+        split_question[2] != ' instruction at file offset ' or
+        split_question[4] != ' ?'
+        ):
+        log_func(f"{rel}: question is not understood by this program (not a next instruction question)")
+        return STATUS_SKIP, None, rel
+
+    if (split_question[3].startswith("0x") or split_question[3].startswith("0X")):
+        file_off = int(split_question[3],16)
+    else:
+        file_off = int(split_question[3])
+        
+    binary = os.path.join(os.path.dirname(cfr_path), prog)
+    if not os.path.isfile(binary):
+        log_func(f"{rel}: binary not found: {binary}")
+        return STATUS_SKIP, None, rel
+
+    try:
+        file_base, link_vaddr = get_elf_text_info(binary)
+        if debug:
+            logger.debug("ELF .text file_base=%s, link_vaddr=%s", hex(file_base), hex(link_vaddr))
+        rt_base = get_runtime_text_base(binary, debug)
+        if debug:
+            logger.debug("runtime .text base=%s", hex(rt_base))
+    except Exception as e:
+        log_func(f"{rel}: skipped ({e})")
+        return STATUS_SKIP, None, rel
+
+    #Just ask if PIE, if so ... base = 0x555555554000, break_va = base + file_off
+
+    base = rt_base - 0x1040 # heuristic for load address
+    if base < 0x400000:
+        base = 0x555555554000
+        break_va = base + file_off
+    else:
+        break_va = get_elf_virtual_address_for_offset(binary, file_off)
+        base = link_vaddr - file_base
+        
+    if debug:
+        logger.debug("JSON file_off=%s, break_va=%s", hex(file_off), hex(break_va))
+
+    log_func(f"\n{rel}")
+    log_func(f"  break VA: {hex(break_va)}")
+
+    arg_map: dict[int, list[str]] = {}
+
+    # --- Parallel Execution Start ---
+    num_workers = max_workers if max_workers else os.cpu_count()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_argc = {
+            executor.submit(check_argc_worker, ac, binary, rt_base, break_va, base, debug): ac
+            for ac in range(0, max_args + 1)
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_argc):
+            ac = future_to_argc[future]
+            try:
+                res_argc, targets = future.result()
+                if targets:
+                    arg_map[res_argc] = targets
+            except Exception as exc:
+                if debug:
+                    logger.error(f"Argc {ac} generated an exception: {exc}")
+    # --- Parallel Execution End ---
+
+    expected = set(data.get("groundtruth", []))
+    found = set()
+    for partial_found in arg_map.values():
+        found.update(partial_found)
+    
+    if found == expected:
+        log_func("  → OK")
+        return STATUS_PASS, arg_map, rel
+    else:
+        log_func("  → MISMATCH")
+        log_func(f"    expected: {sorted(expected)}")
+        log_func(f"         got: {sorted(found)}")
+        return STATUS_FAIL, arg_map, rel
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("root", help="Path to a folder containing cfr files or a specific cfr file")
+    p.add_argument("--max-args", type=int, default=30,
+                   help="Maximum dummy argv count to test")
+    p.add_argument("--debug", action="store_true",
+                   help="Show detailed GDB commands and output")
+    p.add_argument("--workers", type=int, default=None,
+                   help="Number of parallel workers (default: CPU count)")
+    args = p.parse_args()
+
+    logging.basicConfig(format="%(levelname)s: %(message)s",
+                        level=logging.DEBUG if args.debug else logging.INFO)
+
+    # 1. Setup Timestamped Output File
+    now = datetime.datetime.now()
+    # Format: YYYYMMDD_HHMMSS_mmm (milliseconds)
+    ts_str = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    out_filename = f"gt_validate_{ts_str}.txt"
+    
+    print(f"[*] Logging output to: {out_filename}")
+    
+    # Open file handle
+    out_f = open(out_filename, "w", encoding="utf-8")
+
+    # Helper to print to both screen and file
+    def log_msg(msg):
+        print(msg)
+        out_f.write(str(msg) + "\n")
+        out_f.flush() # Ensure real-time update
+
+    log_msg(f"[*] Started validation at {ts_str}")
+    log_msg(f"[*] Root: {args.root}")
+    log_msg(f"[*] Max Args: {args.max_args}")
+    log_msg("-" * 40)
+
+    summary: dict[str, dict[int, str]] = {}
+
+    if os.path.isdir(args.root):
+        files = list(find_cfr_files(args.root))
+    else:
+        files = [args.root]
+
+    # Stats tracking
+    total_files = len(files)
+    count_pass = 0
+    count_fail = 0
+    count_skip = 0
+    
+    for i, cfr in enumerate(files, 1):
+        # Calculate current rates
+        processed = i - 1 # items completed before this one
+        if processed > 0:
+            rate_pass = (count_pass / processed) * 100
+            rate_fail = (count_fail / processed) * 100
+        else:
+            rate_pass = 0.0
+            rate_fail = 0.0
+
+        header = (f"[Progress: {i}/{total_files} | "
+                  f"Pass: {count_pass} ({rate_pass:.1f}%) | "
+                  f"Fail: {count_fail} ({rate_fail:.1f}%) | "
+                  f"Skip: {count_skip}]")
+        
+        log_msg("-" * 60)
+        log_msg(header)
+
+        # Run validation
+        status, arg_map, rel = validate_one(
+            cfr, 
+            os.path.dirname(cfr), 
+            log_msg, # Pass the logger
+            max_args=args.max_args, 
+            debug=args.debug,
+            max_workers=args.workers
+        )
+        
+        if status == STATUS_PASS:
+            count_pass += 1
+        elif status == STATUS_FAIL:
+            count_fail += 1
+        else:
+            count_skip += 1
+
+        if arg_map is not None:
+            summary[rel] = arg_map
+
+    # Final Summary
+    log_msg("=" * 60)
+    log_msg("FINAL SUMMARY")
+    log_msg(f"Total: {total_files}")
+    log_msg(f"Passed: {count_pass}")
+    log_msg(f"Failed: {count_fail}")
+    log_msg(f"Skipped: {count_skip}")
+    if total_files > 0:
+        log_msg(f"Success Rate: {(count_pass/total_files)*100:.2f}%")
+    log_msg("=" * 60)
+
+    # Detailed Summary Table
+    if summary:
+        log_msg("\nDetailed args → targets map:")
+        log_msg(f"{'Binary':<50} {'Argc':<5} {'Target':<30}")
+        log_msg('-' * 70)
+        for rel, amap in summary.items():
+            for argc, target_list in sorted(amap.items()):
+                target = ", ".join(target_list)
+                log_msg(f"{rel:<50} {argc+1:<5} {target:<30}")
+
+    out_f.close()
+    print(f"[*] Log saved to {out_filename}")
+
+if __name__ == "__main__":
+    main()
